@@ -1,0 +1,11 @@
+{
+  "algo": "elo",
+  "current": {"algo": "elo", "rating": 1500, "n": 12},
+  "outcomes": [
+    {
+      "opponent_rating": 1660,
+      "correct": true,
+      "severity": "high"
+    }
+  ]
+}

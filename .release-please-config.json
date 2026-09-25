@@ -1,0 +1,11 @@
+{
+  "release-type": "go",
+  "include-component-in-tag": false,
+  "changelog-type": "default",
+  "packages": {
+    ".": {
+      "release-type": "go",
+      "package-name": "github.com/aguzmans/goelo"
+    }
+  }
+}

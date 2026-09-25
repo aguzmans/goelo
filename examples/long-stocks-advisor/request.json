@@ -1,0 +1,9 @@
+{
+  "algo": "glicko2",
+  "current": {"algo": "glicko2", "rating": 1500, "rd": 350, "vol": 0.06, "n": 0},
+  "periods_elapsed": 0,
+  "outcomes": [
+    {"opponent_rating": 1500, "opponent_rd": 350, "score": 1.0}
+  ],
+  "params": {"tau": 0.5}
+}

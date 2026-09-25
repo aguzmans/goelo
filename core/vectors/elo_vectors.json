@@ -1,0 +1,25 @@
+{
+  "algo": "elo",
+  "source_of_truth": "research/source_credibility_db.go calculateEloChange() as of 2026-09-25",
+  "formula": {
+    "expected": "1 / (1 + 10^((opponent_rating - current)/400))",
+    "actual": "1 if correct else 0  (no draws in the ELO path)",
+    "K_by_severity": {"critical": 64, "high": 48, "medium": 32, "low": 16},
+    "change": "round(K * (actual - expected))   [round = half away from zero]",
+    "new": "clamp(current + change, 800, 2400)",
+    "note": "change is the PRE-clamp rounded delta; new may be clamped independently"
+  },
+  "tolerance": {"new": 0, "change": 0},
+  "cases": [
+    {"name": "even_win_medium",     "in": {"current": 1500, "correct": true,  "opponent_rating": 1500, "severity": "medium"},   "out": {"new": 1516, "change": 16}},
+    {"name": "even_loss_medium",    "in": {"current": 1500, "correct": false, "opponent_rating": 1500, "severity": "medium"},   "out": {"new": 1484, "change": -16}},
+    {"name": "slight_favorite_win", "in": {"current": 1500, "correct": true,  "opponent_rating": 1600, "severity": "medium"},   "out": {"new": 1520, "change": 20}},
+    {"name": "underdog_win_high",   "in": {"current": 1500, "correct": true,  "opponent_rating": 1900, "severity": "high"},     "out": {"new": 1544, "change": 44}},
+    {"name": "favorite_loss_high",  "in": {"current": 1900, "correct": false, "opponent_rating": 1500, "severity": "high"},     "out": {"new": 1856, "change": -44}},
+    {"name": "even_win_critical",   "in": {"current": 1500, "correct": true,  "opponent_rating": 1500, "severity": "critical"}, "out": {"new": 1532, "change": 32}},
+    {"name": "even_loss_low",       "in": {"current": 1500, "correct": false, "opponent_rating": 1500, "severity": "low"},      "out": {"new": 1492, "change": -8}},
+    {"name": "weak_beats_strong",   "in": {"current": 1200, "correct": true,  "opponent_rating": 1500, "severity": "medium"},   "out": {"new": 1227, "change": 27}},
+    {"name": "clamp_floor",         "in": {"current": 810,  "correct": false, "opponent_rating": 810,  "severity": "medium"},   "out": {"new": 800,  "change": -16}},
+    {"name": "clamp_ceiling",       "in": {"current": 2390, "correct": true,  "opponent_rating": 2390, "severity": "medium"},   "out": {"new": 2400, "change": 16}}
+  ]
+}
