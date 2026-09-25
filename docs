@@ -1,0 +1,136 @@
+# Plan: extract Source/Entity Credibility into a standalone OSS rating module
+
+**Status:** proposal for review (drafted for consultation with the ELO-system developer).
+**Origin:** `ai-post-to-wp` `research/source_credibility_*.go` (SPEC-035/037 ELO + tiers).
+**Consumers (both the owner's projects):**
+- `ai-post-to-wp` (Go) — source-domain credibility from fact-check audits.
+- `long-stocks-advisor` (Python) — source/author/insider credibility from *prediction outcomes*
+  (a call triggered by a source/insider that resolves profitably = a "win").
+
+---
+
+## 1. Decisions already made by the owner
+1. Ship **both** a **service (HTTP)** and a **CLI**.
+2. **Storage is NOT the module's concern.** The module is a *stateless rating engine*: caller
+   passes prior state + outcomes, gets new state back. Each project persists state itself.
+3. Each project owns its store — `long-stocks-advisor` uses **Redis**, `ai-post-to-wp` **MySQL**.
+4. Include **Glicko-2 from the start**, optional per entity/project, alongside the existing ELO.
+
+## 2. Consequence of #2: a stateless engine (the core design)
+The module computes ratings; it never loads/saves, never queries "top sources", never resolves
+opponents. All of that stays caller-side. The module's entire job:
+
+    (prior rating state, batch of outcomes, params)  ->  (new rating state, tier, conservative rating)
+
+- **Opponent ratings** are supplied *in the request* (the caller looks them up in its own store).
+- **Ranking / top-N / history** are caller-side DB queries.
+- **Seeds & normalization** are optional helper packages (pure), but applying them is caller-side
+  (cold-start = caller constructs the initial state).
+
+This is what makes storage truly plug-and-play: MySQL vs Redis vs anything never reaches the module.
+
+## 3. Architecture
+```
+credibility-elo/            (new repo; permissive licence — MIT/Apache-2)
+  core/        pure math, no I/O, deterministic
+     elo.go        ELO: new = cur + K(actual-expected); K by severity; clamp 800..2400
+     glicko2.go    Glicko-2: r, RD, volatility; batched rating periods (see §5)
+     tier.go       EloTier()/rating->tier+colour (ported as-is)
+     state.go      serializable Rating state + JSON (the caller-persisted contract)
+     seeds/        optional cold-start packs (news domains; superinvestors) — DATA, versioned
+     normalize/    optional per-entity normalizers (domain eTLD+1 walk; person-name)
+     vectors/      conformance test vectors (lock the math across langs/reimpls)
+  service/     thin stateless HTTP over core (POST /rate, GET /tier)
+  cli/         `credrate rate < req.json > resp.json` | `credrate serve` | `credrate tier`
+```
+No `store/` package ships in the module (per decision #2). Callers implement persistence.
+
+## 4. The wire/state contract (same for service, CLI, and Go in-process)
+**Rating state** (what the caller persists, verbatim):
+```json
+{ "algo": "glicko2",          // or "elo"
+  "rating": 1500.0,
+  "rd": 350.0,                //  glicko2 only
+  "vol": 0.06,                //  glicko2 only
+  "n": 0,                     //  outcomes seen (for provisional logic)
+  "updated_at": "2026-09-25T00:00:00Z" }
+```
+**Rate request:**
+```json
+{ "algo": "glicko2",
+  "current": { ...state... } | null,          // null => new entity (uses defaults/seed)
+  "seed_rating": 1700,                          // optional cold-start (trusted source/insider)
+  "outcomes": [
+    { "opponent_rating": 1800, "opponent_rd": 60, "score": 1.0,
+      "severity": "high" }                       // severity -> ELO K; ignored by glicko2 unless weighted
+  ],
+  "params": { "tau": 0.5, "default_rating": 1500, "default_rd": 350, "default_vol": 0.06,
+              "elo_clamp": [800, 2400] } }
+```
+**Rate response:**
+```json
+{ "state": { ...new state... },
+  "rating": 1512.3, "rd": 290.1,
+  "conservative": 932.1,        // r - 2*RD  (95% lower bound for ranking/weighting)
+  "tier": "news", "change": +12.3 }
+```
+Endpoints: `POST /rate` (stateless), `GET /tier?rating=&rd=`. **No storage endpoints.**
+
+## 5. ELO vs Glicko-2 (both in `core`, `algo` selects)
+- **ELO** = the existing proven code: `expected = 1/(1+10^((opp-cur)/400))`, `new = cur + K(actual-expected)`,
+  K = {critical 64, high 48, medium 32, low 16}, clamp 800..2400, seed floors. Ported ~verbatim.
+- **Glicko-2** = adds RD (uncertainty) + volatility. Full algorithm (Glickman):
+  1. to scale: μ=(r-1500)/173.7178, φ=RD/173.7178
+  2. g(φ)=1/√(1+3φ²/π²); E=1/(1+e^(−g(φⱼ)(μ−μⱼ)))
+  3. v=[Σ g² E(1−E)]⁻¹
+  4. Δ=v·Σ g(sⱼ−E)
+  5. σ′: solve f(x)= eˣ(Δ²−φ²−v−eˣ)/(2(φ²+v+eˣ)²) − (x−ln σ²)/τ² = 0 (Illinois); σ′=e^{x/2}
+  6. φ*=√(φ²+σ′²)
+  7. φ′=1/√(1/φ*²+1/v); μ′=μ+φ′²·Σ g(sⱼ−E)
+  8. back: r′=173.7178μ′+1500, RD′=173.7178φ′
+  - inactivity: φ′=√(φ²+σ²). Ranking value = r−2·RD.
+  - **rating periods:** Glicko-2 batches outcomes per period; the request's `outcomes[]` is one period.
+
+## 6. "Match outcome" per project (the domain-specific part, caller-side)
+- `ai-post-to-wp`: outcome = fact-check **audit** result vs competing sources' avg ELO (current behaviour).
+- `long-stocks-advisor`: outcome = **prediction resolution** (`resolve_prediction_path` → met=win / failed=loss);
+  opponent = avg rating of other sources on the same *deduped* event; severity = event materiality.
+  Same engine rates **sources, authors, insiders, 13F managers** (replaces the heuristic 13F skill-weighting —
+  "Buffett ≠ Musk ≠ random director" becomes an earned rating gap).
+
+## 7. Consumption
+- **Go (`ai-post-to-wp`)**: import `core` in-process (no service); persist to MySQL as today. The existing
+  `SourceCredibilityDB` becomes a thin persistence wrapper that calls `core` for the math.
+- **Python (`long-stocks-advisor`)**: run the `service` container (or shell the CLI); persist returned
+  state to Redis. ~30-line HTTP client.
+
+## 8. Separate stores, shared engine (not a shared ratings DB)
+"Correct" differs: wp = *factually accurate when claiming a fact*; stocks = *news preceded a profitable move*.
+Different competencies → **each project keeps its own store**; the engine (code) is the only shared thing.
+Optional later: wp's accuracy-rating can **seed** the stock project's market-rating prior (Reuters starts high
+in stocks because proven accurate in wp), then each evolves on its own signal. Not v1.
+
+## 9. Conformance vectors
+Ship `core/vectors/*.json` (inputs → expected outputs) for both ELO and Glicko-2 so any port (e.g. a future
+Python-native impl) is provably identical to the Go core.
+
+## 10. Migration for ai-post-to-wp (low-risk, reversible)
+1. Extract pure funcs (`calculateEloChange`, `EloTier`, seeds, `normalizeDomain`) → `core` (export them);
+   import back into `ai-post-to-wp`. Behaviour identical — vectors prove it.
+2. `SourceCredibilityDB` keeps MySQL I/O but delegates math to `core`.
+3. Publish module; `long-stocks-advisor` consumes the `service`.
+4. Generalize domain→entity (add person normalization) + insider/author seed packs.
+
+## 11. Open questions for the ELO-system developer
+1. **Rating periods:** batch per period (Glicko-2's design) or keep per-event updates? Cadence?
+2. **Severity ↔ Glicko-2:** ELO maps severity→K. Glicko-2 has no K — encode severity as an outcome *weight*,
+   or as opponent-strength, or ignore? Recommendation: optional per-outcome weight on Δ/v terms.
+3. **Keep ELO clamps** (800/2400) and seed `audit_floor` semantics in the shared core, or make them params?
+4. **Opponent model for stocks:** avg rating of competing sources on a deduped event vs a fixed 1500 baseline
+   until competition exists.
+5. **Normalization ownership:** keep domain eTLD+1 parent-walk in the module (as an optional helper) or push
+   entirely caller-side?
+6. **Default τ** (0.5?) and provisional threshold (RD above which an entity is "unproven" and down-weighted).
+
+## 12. Non-goals (explicitly out of the module)
+Persistence, ranking/top-N queries, opponent lookup, entity taxonomy, dedup/novelty of events — all caller-side.
